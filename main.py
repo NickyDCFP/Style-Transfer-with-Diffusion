@@ -20,7 +20,7 @@ import unets
 unsqueeze3x = lambda x: x[..., None, None, None]
 
 
-class GuassianDiffusion:
+class GaussianDiffusion:
     """Gaussian diffusion process with 1) Cosine schedule for beta values (https://arxiv.org/abs/2102.09672)
     2) L_simple training objective from https://arxiv.org/abs/2006.11239.
     """
@@ -195,6 +195,7 @@ def train_one_epoch(
     logger,
     lrs,
     args,
+    local_rank,
 ):
     model.train()
     for step, (images, labels) in enumerate(dataloader):
@@ -219,7 +220,7 @@ def train_one_epoch(
             lrs.step()
 
         # update ema_dict
-        if args.local_rank == 0:
+        if local_rank == 0:
             new_dict = model.state_dict()
             for (k, v) in args.ema_dict.items():
                 args.ema_dict[k] = (
@@ -347,18 +348,22 @@ def main():
 
     # misc
     parser.add_argument("--save-dir", type=str, default="./trained_models/")
-    parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--seed", default=112233, type=int)
 
     # setup
     args = parser.parse_args()
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        print("No Local Rank found, defaulting to 0.")
+        local_rank = 0
     metadata = get_metadata(args.dataset)
     torch.backends.cudnn.benchmark = True
-    args.device = "cuda:{}".format(args.local_rank)
+    args.device = "cuda:{}".format(local_rank)
     torch.cuda.set_device(args.device)
-    torch.manual_seed(args.seed + args.local_rank)
-    np.random.seed(args.seed + args.local_rank)
-    if args.local_rank == 0:
+    torch.manual_seed(args.seed + local_rank)
+    np.random.seed(args.seed + local_rank)
+    if local_rank == 0:
         print(args)
 
     # Creat model and diffusion process
@@ -368,11 +373,11 @@ def main():
         out_channels=metadata.num_channels,
         num_classes=metadata.num_classes if args.class_cond else None,
     ).to(args.device)
-    if args.local_rank == 0:
+    if local_rank == 0:
         print(
             "We are assuming that model input/ouput pixel range is [-1, 1]. Please adhere to it."
         )
-    diffusion = GuassianDiffusion(args.diffusion_steps, args.device)
+    diffusion = GaussianDiffusion(args.diffusion_steps, args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # load pre-trained model
@@ -397,11 +402,11 @@ def main():
     # distributed training
     ngpus = torch.cuda.device_count()
     if ngpus > 1:
-        if args.local_rank == 0:
+        if local_rank == 0:
             print(f"Using distributed training on {ngpus} gpus.")
         args.batch_size = args.batch_size // ngpus
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     # sampling
     if args.sampling_only:
@@ -438,7 +443,7 @@ def main():
         num_workers=4,
         pin_memory=True,
     )
-    if args.local_rank == 0:
+    if local_rank == 0:
         print(
             f"Training dataset loaded: Number of batches: {len(train_loader)}, Number of images: {len(train_set)}"
         )
@@ -451,7 +456,7 @@ def main():
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args)
+        train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args, local_rank)
         if not epoch % 1:
             sampled_images, _ = sample_N_images(
                 64,
@@ -465,27 +470,27 @@ def main():
                 metadata.num_classes,
                 args,
             )
-            if args.local_rank == 0:
+            if local_rank == 0:
                 cv2.imwrite(
                     os.path.join(
                         args.save_dir,
-                        f"{args.arch}_{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps-class_condn_{args.class_cond}.png",
+                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps.png",
                     ),
                     np.concatenate(sampled_images, axis=1)[:, :, ::-1],
                 )
-        if args.local_rank == 0:
+        if local_rank == 0:
             torch.save(
                 model.state_dict(),
                 os.path.join(
                     args.save_dir,
-                    f"{args.arch}_{args.dataset}-epoch_{args.epochs}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}.pt",
+                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps.pt",
                 ),
             )
             torch.save(
                 args.ema_dict,
                 os.path.join(
                     args.save_dir,
-                    f"{args.arch}_{args.dataset}-epoch_{args.epochs}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}_ema_{args.ema_w}.pt",
+                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}.pt",
                 ),
             )
 
