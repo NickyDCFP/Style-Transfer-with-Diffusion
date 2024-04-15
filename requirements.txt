@@ -1,0 +1,8 @@
+easydict
+numpy
+Pillow
+Pillow
+scipy
+torch
+torchvision
+tqdm

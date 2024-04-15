@@ -103,7 +103,8 @@ class GaussianDiffusion:
         return xt.float(), eps
 
     def sample_from_reverse_process(
-        self, model, xT, timesteps=None, model_kwargs={}, ddim=False
+        # MODIFICATION
+        self, model, xT, style, timesteps=None, model_kwargs={}, ddim=False
     ):
         """Sampling images by iterating over all timesteps.
 
@@ -117,6 +118,7 @@ class GaussianDiffusion:
 
         Return: An image tensor with identical shape as XT.
         """
+
         model.eval()
         final = xT
 
@@ -137,7 +139,10 @@ class GaussianDiffusion:
             with torch.no_grad():
                 current_t = torch.tensor([t] * len(final), device=final.device)
                 current_sub_t = torch.tensor([i] * len(final), device=final.device)
-                pred_epsilon = model(final, current_t, **model_kwargs)
+                
+                # MODIFICATION
+                pred_epsilon = model(final, current_t, style[0].repeat(len(final), 1, 1, 1), **model_kwargs)
+                
                 # using xt+x0 to derive mu_t, instead of using xt+eps (former is more stable)
                 pred_x0 = self.get_x0_from_xt_eps(
                     final, pred_epsilon, current_sub_t, scalars
@@ -210,9 +215,16 @@ def train_one_epoch(
             args.device
         )
         xt, eps = diffusion.sample_from_forward_process(images, t)
-        pred_eps = model(xt, t, y=labels)
+        
+        # MODIFICATION
+        style_indices = torch.randperm(images.shape[0])
+        style_images = images[style_indices]
+        pred_eps = model(xt, t, style_images, y=labels)
+        
+        # lambda_cyc: constant for the loss of the style image with the model output
+        loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (xt - style_images))).mean()
 
-        loss = ((pred_eps - eps) ** 2).mean()
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -233,6 +245,8 @@ def sample_N_images(
     N,
     model,
     diffusion,
+    # MODIFICATION
+    style,
     xT=None,
     sampling_steps=250,
     batch_size=64,
@@ -260,6 +274,10 @@ def sample_N_images(
     """
     samples, labels, num_samples = [], [], 0
     num_processes, group = dist.get_world_size(), dist.group.WORLD
+    
+    # print('\n', args, '\n')
+    # print("\nSAMPLING\n")
+
     with tqdm(total=math.ceil(N / (args.batch_size * num_processes))) as pbar:
         while num_samples < N:
             if xT is None:
@@ -275,7 +293,7 @@ def sample_N_images(
             else:
                 y = None
             gen_images = diffusion.sample_from_reverse_process(
-                model, xT, sampling_steps, {"y": y}, args.ddim
+                model, xT, style, sampling_steps, {"y": y}, args.ddim
             )
             samples_list = [torch.zeros_like(gen_images) for _ in range(num_processes)]
             if args.class_cond:
@@ -289,7 +307,7 @@ def sample_N_images(
             pbar.update(1)
     samples = np.concatenate(samples).transpose(0, 2, 3, 1)[:N]
     samples = (127.5 * (samples + 1)).astype(np.uint8)
-    return (samples, np.concatenate(labels) if args.class_cond else None)
+    return (samples, np.concatenate(labels) if args.class_cond else None, style[0])
 
 
 def main():
@@ -345,7 +363,9 @@ def main():
         default=50000,
         help="Number of images required to sample from the model",
     )
-
+        #MODIFICATION
+    parser.add_argument("--lambda_cyc", type=float, default=0.05)
+    
     # misc
     parser.add_argument("--save-dir", type=str, default="./trained_models/")
     parser.add_argument("--seed", default=112233, type=int)
@@ -407,13 +427,18 @@ def main():
         args.batch_size = args.batch_size // ngpus
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    elif ngpus == 1:
+        torch.distributed.init_process_group(backend='nccl', init_method="env://", world_size=1, rank=0)
+        model = DDP(model, device_ids=[0], output_device=0)
+        args.batch_size = args.batch_size // ngpus
 
     # sampling
     if args.sampling_only:
-        sampled_images, labels = sample_N_images(
+        sampled_images, labels, _ = sample_N_images(
             args.num_sampled_images,
             model,
             diffusion,
+            train_loader.dataset[0],
             None,
             args.sampling_steps,
             args.batch_size,
@@ -458,10 +483,12 @@ def main():
             sampler.set_epoch(epoch)
         train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args, local_rank)
         if not epoch % 1:
-            sampled_images, _ = sample_N_images(
+            sampled_images, _, style_image = sample_N_images(
                 64,
                 model,
                 diffusion,
+                # MODIFICATION
+                train_loader.dataset[0],
                 None,
                 args.sampling_steps,
                 args.batch_size,
@@ -474,23 +501,32 @@ def main():
                 cv2.imwrite(
                     os.path.join(
                         args.save_dir,
-                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps.png",
+                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}.png",
                     ),
                     np.concatenate(sampled_images, axis=1)[:, :, ::-1],
                 )
+
+                cv2.imwrite(
+                    os.path.join(
+                        args.save_dir,
+                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}_style_image.png",
+                    ),
+                    style_image.numpy().T * 255
+                )
+
         if local_rank == 0:
             torch.save(
                 model.state_dict(),
                 os.path.join(
                     args.save_dir,
-                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps.pt",
+                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}.pt",
                 ),
             )
             torch.save(
                 args.ema_dict,
                 os.path.join(
                     args.save_dir,
-                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}.pt",
+                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}_lambda_cyc-{args.lambda_cyc}.pt",
                 ),
             )
 

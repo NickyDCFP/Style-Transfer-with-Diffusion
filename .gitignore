@@ -2,3 +2,8 @@
 /dataset/
 /runners/
 /images/
+/trained_models/
+/penv/
+/data/
+/slurm*
+/test.sh

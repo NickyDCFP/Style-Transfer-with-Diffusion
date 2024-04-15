@@ -7,6 +7,9 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
+# MODIFICATION
+from messrs import ImageEmbedding
+
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
@@ -600,6 +603,9 @@ class UNetModel(nn.Module):
             linear(time_embed_dim, time_embed_dim),
         )
 
+        # MODIFICATION
+        self.image_embed = ImageEmbedding()
+
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
@@ -741,7 +747,8 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, timesteps, y=None):
+    # MODIFICATION
+    def forward(self, x, timesteps, style_image, y=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -758,7 +765,16 @@ class UNetModel(nn.Module):
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+            emb = emb + self.label_emb(y)    
+        
+        # MODIFICATION
+        # style_image_embeddings = []
+        # print(style_image.shape)
+        # for s in style_image:
+        #     style_image_embeddings.append(self.image_embed(s))
+        # emb = emb + np.array(style_image_embeddings)
+        emb = emb + self.image_embed(style_image)
+        
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
