@@ -395,19 +395,19 @@ class AttentionBlock(nn.Module):
         self,
         channels,
         num_heads=1,
-        num_head_channels=-1,
+        num_heads_channels=-1,
         use_checkpoint=False,
         use_new_attention_order=False,
     ):
         super().__init__()
         self.channels = channels
-        if num_head_channels == -1:
+        if num_heads_channels == -1:
             self.num_heads = num_heads
         else:
             assert (
-                channels % num_head_channels == 0
-            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
-            self.num_heads = channels // num_head_channels
+                channels % num_heads_channels == 0
+            ), f"q,k,v channels {channels} is not divisible by num_heads_channels {num_heads_channels}"
+            self.num_heads = channels // num_heads_channels
         self.use_checkpoint = use_checkpoint
         self.norm = normalization(channels)
         self.qkv = conv_nd(1, channels, channels * 3, 1)
@@ -535,8 +535,6 @@ class UNetModel(nn.Module):
     :param conv_resample: if True, use learned convolutions for upsampling and
         downsampling.
     :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param num_classes: if specified (as an int), then this model will be
-        class-conditional with `num_classes` classes.
     :param use_checkpoint: use gradient checkpointing to reduce memory usage.
     :param num_heads: the number of attention heads in each attention layer.
     :param num_heads_channels: if specified, ignore num_heads and instead use
@@ -551,7 +549,7 @@ class UNetModel(nn.Module):
 
     def __init__(
         self,
-        image_size,
+        time_dim,
         in_channels,
         model_channels,
         out_channels,
@@ -566,18 +564,18 @@ class UNetModel(nn.Module):
         use_checkpoint=False,
         use_fp16=False,
         num_heads=1,
-        num_head_channels=-1,
+        num_heads_channels=-1,
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
         resblock_updown=False,
-        use_new_attention_order=False,
+        use_new_attention_order=True,
     ):
         super().__init__()
 
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
 
-        self.image_size = image_size
+        self.time_dim = time_dim
         self.in_channels = in_channels
         self.model_channels = model_channels
         self.out_channels = out_channels
@@ -590,7 +588,7 @@ class UNetModel(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
-        self.num_head_channels = num_head_channels
+        self.num_heads_channels = num_heads_channels
         self.num_heads_upsample = num_heads_upsample
 
         time_embed_dim = model_channels * time_emb_factor
@@ -600,8 +598,8 @@ class UNetModel(nn.Module):
             linear(time_embed_dim, time_embed_dim),
         )
 
-        if self.num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+        # if self.num_classes is not None:
+        #     self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
@@ -630,7 +628,7 @@ class UNetModel(nn.Module):
                             ch,
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads,
-                            num_head_channels=num_head_channels,
+                            num_heads_channels=num_heads_channels,
                             use_new_attention_order=use_new_attention_order,
                         )
                     )
@@ -675,7 +673,7 @@ class UNetModel(nn.Module):
                 ch,
                 use_checkpoint=use_checkpoint,
                 num_heads=num_heads,
-                num_head_channels=num_head_channels,
+                num_heads_channels=num_heads_channels,
                 use_new_attention_order=use_new_attention_order,
             ),
             ResBlock(
@@ -711,7 +709,7 @@ class UNetModel(nn.Module):
                             ch,
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads_upsample,
-                            num_head_channels=num_head_channels,
+                            num_heads_channels=num_heads_channels,
                             use_new_attention_order=use_new_attention_order,
                         )
                     )
@@ -749,16 +747,11 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
-
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-        if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+        # if self.num_classes is not None:
+        #     assert y.shape == (x.shape[0],)
+        #     emb = emb + self.label_emb(y)
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
@@ -772,33 +765,33 @@ class UNetModel(nn.Module):
 
 
 def UNetBig(
-    image_size,
+    time_dim,
     in_channels=3,
     out_channels=3,
     base_width=192,
     num_classes=None,
 ):
-    if image_size == 128:
+    if time_dim == 128:
         channel_mult = (1, 1, 2, 3, 4)
-    elif image_size == 64:
+    elif time_dim == 64:
         channel_mult = (1, 2, 3, 4)
-    elif image_size == 32:
+    elif time_dim == 32:
         channel_mult = (1, 2, 2, 2)
-    elif image_size == 28:
+    elif time_dim == 28:
         channel_mult = (1, 2, 2, 2)
     else:
-        raise ValueError(f"unsupported image size: {image_size}")
+        raise ValueError(f"unsupported image size: {time_dim}")
 
     attention_ds = []
-    if image_size == 28:
+    if time_dim == 28:
         attention_resolutions = "28,14,7"
     else:
         attention_resolutions = "32,16,8"
     for res in attention_resolutions.split(","):
-        attention_ds.append(image_size // int(res))
+        attention_ds.append(time_dim // int(res))
 
     return UNetModel(
-        image_size=image_size,
+        time_dim=time_dim,
         in_channels=in_channels,
         model_channels=base_width,
         out_channels=out_channels,
@@ -810,7 +803,7 @@ def UNetBig(
         use_checkpoint=False,
         use_fp16=False,
         num_heads=4,
-        num_head_channels=64,
+        num_heads_channels=64,
         num_heads_upsample=-1,
         use_scale_shift_norm=True,
         resblock_updown=True,
@@ -819,33 +812,23 @@ def UNetBig(
 
 
 def UNet(
-    image_size,
+    time_dim,
     in_channels=3,
     out_channels=3,
     base_width=64,
     num_classes=None,
 ):
-    if image_size == 128:
-        channel_mult = (1, 1, 2, 3, 4)
-    elif image_size == 64:
-        channel_mult = (1, 2, 3, 4)
-    elif image_size == 32:
-        channel_mult = (1, 2, 2, 2)
-    elif image_size == 28:
-        channel_mult = (1, 2, 2, 2)
+    if time_dim == 1024:
+        channel_mult = (1, 1, 1, 2, 2, 3, 4)
     else:
-        raise ValueError(f"unsupported image size: {image_size}")
-
+        raise ValueError(f"unsupported image size: {time_dim}")
     attention_ds = []
-    if image_size == 28:
-        attention_resolutions = "28,14,7"
-    else:
-        attention_resolutions = "32,16,8"
+    attention_resolutions = "32, 16, 8"
     for res in attention_resolutions.split(","):
-        attention_ds.append(image_size // int(res))
+        attention_ds.append(time_dim // int(res))
 
     return UNetModel(
-        image_size=image_size,
+        time_dim=time_dim,
         in_channels=in_channels,
         model_channels=base_width,
         out_channels=out_channels,
@@ -857,7 +840,7 @@ def UNet(
         use_checkpoint=False,
         use_fp16=False,
         num_heads=4,
-        num_head_channels=64,
+        num_heads_channels=-1,
         num_heads_upsample=-1,
         use_scale_shift_norm=True,
         resblock_updown=True,
@@ -866,33 +849,33 @@ def UNet(
 
 
 def UNetSmall(
-    image_size,
+    time_dim,
     in_channels=3,
     out_channels=3,
     base_width=32,
     num_classes=None,
 ):
-    if image_size == 128:
+    if time_dim == 128:
         channel_mult = (1, 1, 2, 3, 4)
-    elif image_size == 64:
+    elif time_dim == 64:
         channel_mult = (1, 2, 3, 4)
-    elif image_size == 32:
+    elif time_dim == 32:
         channel_mult = (1, 2, 2, 2)
-    elif image_size == 28:
+    elif time_dim == 28:
         channel_mult = (1, 2, 2, 2)
     else:
-        raise ValueError(f"unsupported image size: {image_size}")
+        raise ValueError(f"unsupported image size: {time_dim}")
 
     attention_ds = []
-    if image_size == 28:
+    if time_dim == 28:
         attention_resolutions = "28,14,7"
     else:
         attention_resolutions = "32,16,8"
     for res in attention_resolutions.split(","):
-        attention_ds.append(image_size // int(res))
+        attention_ds.append(time_dim // int(res))
 
     return UNetModel(
-        image_size=image_size,
+        time_dim=time_dim,
         in_channels=in_channels,
         model_channels=base_width,
         out_channels=out_channels,
@@ -905,7 +888,7 @@ def UNetSmall(
         use_checkpoint=False,
         use_fp16=False,
         num_heads=4,
-        num_head_channels=32,
+        num_heads_channels=32,
         num_heads_upsample=-1,
         use_scale_shift_norm=True,
         resblock_updown=True,

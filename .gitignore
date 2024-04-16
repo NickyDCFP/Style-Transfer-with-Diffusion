@@ -2,3 +2,6 @@
 /dataset/
 /runners/
 /images/
+/diffwave/build/
+/diffwave/src/diffwave.egg-info/
+/diffwave/src/diffwave/__pycache__/

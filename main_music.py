@@ -1,5 +1,4 @@
 import os
-import cv2
 import copy
 import math
 import argparse
@@ -13,8 +12,9 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torchaudio
 
-from data import get_metadata, get_dataset, fix_legacy_dict
+from data_music import fix_legacy_dict, get_metadata, decode_spectrogram, encode_spectrogram, get_gtzan, collate_gtzan, decode_spectrogram_diffwave
 import unets
 
 unsqueeze3x = lambda x: x[..., None, None, None]
@@ -92,7 +92,7 @@ class GaussianDiffusion:
         return EasyDict(dict([(k, v.float()) for (k, v) in all_scalars.items()]))
 
     def sample_from_forward_process(self, x0, t):
-        """Single step of the forward process, where we add noise in the image.
+        """Single step of the forward process, where we add noise in the music.
         Note that we will use this paritcular realization of noise vector (eps) in training.
         """
         eps = torch.randn_like(x0)
@@ -105,7 +105,7 @@ class GaussianDiffusion:
     def sample_from_reverse_process(
         self, model, xT, timesteps=None, model_kwargs={}, ddim=False
     ):
-        """Sampling images by iterating over all timesteps.
+        """Sampling music by iterating over all timesteps.
 
         model: diffusion model
         xT: Starting noise vector.
@@ -113,9 +113,9 @@ class GaussianDiffusion:
             i.e., timesteps in the diffusion process).
         model_kwargs: Additional kwargs for model (using it to feed class label for conditioning)
         ddim: Use ddim sampling (https://arxiv.org/abs/2010.02502). With very small number of
-            sampling steps, use ddim sampling for better image quality.
+            sampling steps, use ddim sampling for better music quality.
 
-        Return: An image tensor with identical shape as XT.
+        Return: An music tensor with identical shape as XT.
         """
         model.eval()
         final = xT
@@ -195,22 +195,22 @@ def train_one_epoch(
     logger,
     lrs,
     args,
+    metadata,
     local_rank,
 ):
     model.train()
-    for step, (images, labels) in enumerate(dataloader):
-        assert (images.max().item() <= 1) and (0 <= images.min().item())
+    for step, (tracks) in enumerate(dataloader):
+        # assert (tracks.max().item() <= 1) and (-1 <= tracks.min().item()), f"range is [{tracks.min().item(), tracks.max().item()}]"
 
-        # must use [-1, 1] pixel range for images
-        images, labels = (
-            2 * images.to(args.device) - 1,
-            labels.to(args.device) if args.class_cond else None,
-        )
-        t = torch.randint(diffusion.timesteps, (len(images),), dtype=torch.int64).to(
+        # must use [-1, 1] pixel range for music
+        tracks = torch.stack([
+            encode_spectrogram(tracks[i], metadata) for i in range(len(tracks))
+        ]).to(args.device)
+        t = torch.randint(diffusion.timesteps, (len(tracks),), dtype=torch.int64).to(
             args.device
         )
-        xt, eps = diffusion.sample_from_forward_process(images, t)
-        pred_eps = model(xt, t, y=labels)
+        xt, eps = diffusion.sample_from_forward_process(tracks, t)
+        pred_eps = model(xt, t)
 
         loss = ((pred_eps - eps) ** 2).mean()
         optimizer.zero_grad()
@@ -218,6 +218,7 @@ def train_one_epoch(
         optimizer.step()
         if lrs is not None:
             lrs.step()
+        tracks = tracks.cpu()
 
         # update ema_dict
         if local_rank == 0:
@@ -229,7 +230,7 @@ def train_one_epoch(
             logger.log(loss.item(), display=not step % 100)
 
 
-def sample_N_images(
+def sample_N_tracks(
     N,
     model,
     diffusion,
@@ -237,71 +238,117 @@ def sample_N_images(
     sampling_steps=250,
     batch_size=64,
     num_channels=3,
-    image_size=32,
-    num_classes=None,
+    height_dim=256,
+    time_dim=2048,
     args=None,
 ):
-    """use this function to sample any number of images from a given
+    """use this function to sample any number of tracks from a given
         diffusion model and diffusion process.
 
     Args:
-        N : Number of images
+        N : Number of tracks
         model : Diffusion model
         diffusion : Diffusion process
         xT : Starting instantiation of noise vector.
         sampling_steps : Number of sampling steps.
         batch_size : Batch-size for sampling.
-        num_channels : Number of channels in the image.
-        image_size : Image size (assuming square images).
+        num_channels : Number of channels in the music.
+        length_samples : music spectrogram in  time frames
         num_classes : Number of classes in the dataset (needed for class-conditioned models)
         args : All args from the argparser.
 
-    Returns: Numpy array with N images and corresponding labels.
+    Returns: Numpy array with N tracks.
     """
-    samples, labels, num_samples = [], [], 0
+    samples, num_samples = [], 0
     num_processes, group = dist.get_world_size(), dist.group.WORLD
     with tqdm(total=math.ceil(N / (args.batch_size * num_processes))) as pbar:
         while num_samples < N:
             if xT is None:
                 xT = (
-                    torch.randn(batch_size, num_channels, image_size, image_size)
+                    torch.randn(batch_size, num_channels, height_dim, time_dim)
                     .float()
                     .to(args.device)
                 )
-            if args.class_cond:
-                y = torch.randint(num_classes, (len(xT),), dtype=torch.int64).to(
-                    args.device
-                )
-            else:
-                y = None
-            gen_images = diffusion.sample_from_reverse_process(
-                model, xT, sampling_steps, {"y": y}, args.ddim
+            gen_music = diffusion.sample_from_reverse_process(
+                model, xT, sampling_steps, {"y" : None}, args.ddim
             )
-            samples_list = [torch.zeros_like(gen_images) for _ in range(num_processes)]
-            if args.class_cond:
-                labels_list = [torch.zeros_like(y) for _ in range(num_processes)]
-                dist.all_gather(labels_list, y, group)
-                labels.append(torch.cat(labels_list).detach().cpu().numpy())
+            samples_list = [torch.zeros_like(gen_music) for _ in range(num_processes)]
 
-            dist.all_gather(samples_list, gen_images, group)
+            dist.all_gather(samples_list, gen_music, group)
             samples.append(torch.cat(samples_list).detach().cpu().numpy())
             num_samples += len(xT) * num_processes
             pbar.update(1)
-    samples = np.concatenate(samples).transpose(0, 2, 3, 1)[:N]
-    samples = (127.5 * (samples + 1)).astype(np.uint8)
-    return (samples, np.concatenate(labels) if args.class_cond else None)
+    samples = np.concatenate(samples)[:N]
+    samples = torch.Tensor(samples)
+    samples[samples == 0] = 1e-5
+    # samples = np.concatenate(samples)[:N]
+    # samples = (127.5 * (samples + 1)).astype(np.uint8)
+    return samples
+
+def sample_and_save_tracks(
+    args,
+    model,
+    diffusion,
+    metadata,
+
+):
+    sampled_specs = sample_N_tracks(
+        args.num_sampled_tracks,
+        model,
+        diffusion,
+        None,
+        args.sampling_steps,
+        args.batch_size,
+        metadata.num_channels,
+        height_dim=metadata.rescaled_height_dim,
+        time_dim=metadata.time_dim,
+        args=args,
+    )
+    if args.save_specs:
+        torch.save(
+            sampled_specs.squeeze(0),
+            os.path.join(
+                args.save_dir,
+                f"spec_{args.sampling_steps}-sampling_steps.pt"
+            )
+        )
+    # if args.no_diffwave:
+    sampled_waves = torch.cat(
+        [
+            decode_spectrogram(sampled_specs[i, :, :, :], metadata)
+            for i in range(sampled_specs.size(0))
+        ],
+        dim=1
+    )
+    sampled_diffwaves = torch.cat(
+        [
+            decode_spectrogram_diffwave(sampled_specs[i, :, :, :], metadata, args)
+            for i in range(sampled_specs.size(0))
+        ],
+        dim=1
+    )
+    torchaudio.save(
+        os.path.join(
+            args.save_dir,
+            f"sampling_steps-{args.sampling_steps}.wav",
+        ),
+        sampled_waves,
+        metadata.sampling_rate
+    )
+    torchaudio.save(
+        os.path.join(
+            args.save_dir,
+            f"sampling_steps-{args.sampling_steps}_diffwave.wav",
+        ),
+        sampled_diffwaves,
+        metadata.sampling_rate
+    )
 
 
 def main():
     parser = argparse.ArgumentParser("Minimal implementation of diffusion models")
     # diffusion model
     parser.add_argument("--arch", type=str, help="Neural network architecture")
-    parser.add_argument(
-        "--class-cond",
-        action="store_true",
-        default=False,
-        help="train class-conditioned diffusion model",
-    )
     parser.add_argument(
         "--diffusion-steps",
         type=int,
@@ -321,11 +368,10 @@ def main():
         help="Sampling using DDIM update step",
     )
     # dataset
-    parser.add_argument("--dataset", type=str)
-    parser.add_argument("--data-dir", type=str, default="./dataset/")
+    parser.add_argument("--data-dir", type=str, default="./dataset/GTZAN/")
     # optimizer
     parser.add_argument(
-        "--batch-size", type=int, default=128, help="batch-size per gpu"
+        "--batch-size", type=int, default=32, help="batch-size per gpu"
     )
     parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--epochs", type=int, default=500)
@@ -337,13 +383,25 @@ def main():
         "--sampling-only",
         action="store_true",
         default=False,
-        help="No training, just sample images (will save them in --save-dir)",
+        help="No training, just sample music (will save it in --save-dir)",
     )
     parser.add_argument(
-        "--num-sampled-images",
+        "--num-sampled-tracks",
+        default=6,
         type=int,
-        default=50000,
-        help="Number of images required to sample from the model",
+        help="Number of music tracks to sample"
+    )
+    parser.add_argument(
+        "--no-diffwave",
+        action="store_true",
+        default=False,
+        help="Don't use diffwave to decode",
+    )
+    parser.add_argument(
+        "--save-specs",
+        action="store_true",
+        default=False,
+        help="Store generated spectrograms as well"
     )
 
     # misc
@@ -357,7 +415,6 @@ def main():
     else:
         print("No Local Rank found, defaulting to 0.")
         local_rank = 0
-    metadata = get_metadata(args.dataset)
     torch.backends.cudnn.benchmark = True
     args.device = "cuda:{}".format(local_rank)
     torch.cuda.set_device(args.device)
@@ -365,18 +422,13 @@ def main():
     np.random.seed(args.seed + local_rank)
     if local_rank == 0:
         print(args)
-
-    # Creat model and diffusion process
+    metadata = get_metadata('gtzan')
+    music = get_gtzan(args.data_dir)
     model = unets.__dict__[args.arch](
-        image_size=metadata.image_size,
+        time_dim=metadata.time_dim,
         in_channels=metadata.num_channels,
         out_channels=metadata.num_channels,
-        num_classes=metadata.num_classes if args.class_cond else None,
     ).to(args.device)
-    if local_rank == 0:
-        print(
-            "We are assuming that model input/ouput pixel range is [-1, 1]. Please adhere to it."
-        )
     diffusion = GaussianDiffusion(args.diffusion_steps, args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -408,44 +460,24 @@ def main():
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    # sampling
     if args.sampling_only:
-        sampled_images, labels = sample_N_images(
-            args.num_sampled_images,
-            model,
-            diffusion,
-            None,
-            args.sampling_steps,
-            args.batch_size,
-            metadata.num_channels,
-            metadata.image_size,
-            metadata.num_classes,
-            args,
-        )
-        np.savez(
-            os.path.join(
-                args.save_dir,
-                f"{args.arch}_{args.dataset}-{args.sampling_steps}-sampling_steps-{len(sampled_images)}_images-class_condn_{args.class_cond}.npz",
-            ),
-            sampled_images,
-            labels,
-        )
+        sample_and_save_tracks(args, model, diffusion, metadata)
         return
 
     # Load dataset
-    train_set = get_dataset(args.dataset, args.data_dir, metadata)
-    sampler = DistributedSampler(train_set) if ngpus > 1 else None
+    sampler = DistributedSampler(music) if ngpus > 1 else None
     train_loader = DataLoader(
-        train_set,
+        music,
         batch_size=args.batch_size,
         shuffle=sampler is None,
         sampler=sampler,
         num_workers=4,
         pin_memory=True,
+        collate_fn=collate_gtzan
     )
     if local_rank == 0:
         print(
-            f"Training dataset loaded: Number of batches: {len(train_loader)}, Number of images: {len(train_set)}"
+            f"Training dataset loaded: Number of batches: {len(train_loader)}, Samples of music: {len(music)}"
         )
     logger = loss_logger(len(train_loader) * args.epochs)
 
@@ -454,46 +486,27 @@ def main():
 
     # lets start training the model
     for epoch in range(args.epochs):
+        print("Epoch", epoch + 1)
         if sampler is not None:
             sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args, local_rank)
-        if not epoch % 1:
-            sampled_images, _ = sample_N_images(
-                64,
-                model,
-                diffusion,
-                None,
-                args.sampling_steps,
-                args.batch_size,
-                metadata.num_channels,
-                metadata.image_size,
-                metadata.num_classes,
-                args,
-            )
+        train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args, metadata, local_rank)
+        if (not epoch % 50) or (epoch == args.epochs - 1):
+            sample_and_save_tracks(args, model, diffusion, metadata)
             if local_rank == 0:
-                cv2.imwrite(
+                torch.save(
+                    model.state_dict(),
                     os.path.join(
                         args.save_dir,
-                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps.png",
+                        f"epoch_{args.epochs}-{args.sampling_steps}-sampling_steps.pt",
                     ),
-                    np.concatenate(sampled_images, axis=1)[:, :, ::-1],
                 )
-        if local_rank == 0:
-            torch.save(
-                model.state_dict(),
-                os.path.join(
-                    args.save_dir,
-                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps.pt",
-                ),
-            )
-            torch.save(
-                args.ema_dict,
-                os.path.join(
-                    args.save_dir,
-                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}.pt",
-                ),
-            )
-
+                torch.save(
+                    args.ema_dict,
+                    os.path.join(
+                        args.save_dir,
+                        f"epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}.pt",
+                    ),
+                )
 
 if __name__ == "__main__":
     main()
