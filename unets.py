@@ -7,6 +7,8 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
+from style_enc import StyleEncoder
+
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
@@ -162,7 +164,7 @@ class AttentionPool2d(nn.Module):
     ):
         super().__init__()
         self.positional_embedding = nn.Parameter(
-            th.randn(embed_dim, spacial_dim ** 2 + 1) / embed_dim ** 0.5
+            th.randn(embed_dim, spacial_dim**2 + 1) / embed_dim**0.5
         )
         self.qkv_proj = conv_nd(1, embed_dim, 3 * embed_dim, 1)
         self.c_proj = conv_nd(1, embed_dim, output_dim or embed_dim, 1)
@@ -448,7 +450,7 @@ def count_flops_attn(model, _x, y):
     # We perform two matmuls with the same number of ops.
     # The first computes the weight matrix, the second computes
     # the combination of the value vectors.
-    matmul_ops = 2 * b * (num_spatial ** 2) * c
+    matmul_ops = 2 * b * (num_spatial**2) * c
     model.total_ops += th.DoubleTensor([matmul_ops])
 
 
@@ -560,7 +562,7 @@ class UNetModel(nn.Module):
         channel_mult=(1, 2, 4, 8),
         conv_resample=True,
         dims=2,
-        num_classes=None,
+        use_style=True,
         use_checkpoint=False,
         use_fp16=False,
         num_heads=1,
@@ -584,7 +586,7 @@ class UNetModel(nn.Module):
         self.dropout = dropout
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
-        self.num_classes = num_classes
+        self.use_style = use_style
         self.use_checkpoint = use_checkpoint
         self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
@@ -597,9 +599,8 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
-
-        # if self.num_classes is not None:
-        #     self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+        if self.use_style:
+            self.style_encoder = StyleEncoder()
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
@@ -739,7 +740,7 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, timesteps, y=None):
+    def forward(self, x, timesteps, style=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -749,9 +750,10 @@ class UNetModel(nn.Module):
         """
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-        # if self.num_classes is not None:
-        #     assert y.shape == (x.shape[0],)
-        #     emb = emb + self.label_emb(y)
+        if self.use_style:
+            assert style is not None and style.size() == x.size(), \
+                "Please provide a style track of the same size as input track"
+            emb = emb + self.style_encoder(style)
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
@@ -763,60 +765,12 @@ class UNetModel(nn.Module):
         h = h.type(x.dtype)
         return self.out(h)
 
-
-def UNetBig(
-    time_dim,
-    in_channels=3,
-    out_channels=3,
-    base_width=192,
-    num_classes=None,
-):
-    if time_dim == 128:
-        channel_mult = (1, 1, 2, 3, 4)
-    elif time_dim == 64:
-        channel_mult = (1, 2, 3, 4)
-    elif time_dim == 32:
-        channel_mult = (1, 2, 2, 2)
-    elif time_dim == 28:
-        channel_mult = (1, 2, 2, 2)
-    else:
-        raise ValueError(f"unsupported image size: {time_dim}")
-
-    attention_ds = []
-    if time_dim == 28:
-        attention_resolutions = "28,14,7"
-    else:
-        attention_resolutions = "32,16,8"
-    for res in attention_resolutions.split(","):
-        attention_ds.append(time_dim // int(res))
-
-    return UNetModel(
-        time_dim=time_dim,
-        in_channels=in_channels,
-        model_channels=base_width,
-        out_channels=out_channels,
-        num_res_blocks=3,
-        attention_resolutions=tuple(attention_ds),
-        dropout=0.1,
-        channel_mult=channel_mult,
-        num_classes=num_classes,
-        use_checkpoint=False,
-        use_fp16=False,
-        num_heads=4,
-        num_heads_channels=64,
-        num_heads_upsample=-1,
-        use_scale_shift_norm=True,
-        resblock_updown=True,
-        use_new_attention_order=True,
-    )
-
-
 def UNet(
     time_dim,
-    in_channels=3,
-    out_channels=3,
+    in_channels=1,
+    out_channels=1,
     base_width=64,
-    num_classes=None,
+    use_style=True,
 ):
     if time_dim == 1024:
         channel_mult = (1, 1, 1, 2, 2, 3, 4)
@@ -836,59 +790,11 @@ def UNet(
         attention_resolutions=tuple(attention_ds),
         dropout=0.1,
         channel_mult=channel_mult,
-        num_classes=num_classes,
+        use_style=use_style,
         use_checkpoint=False,
         use_fp16=False,
         num_heads=4,
         num_heads_channels=-1,
-        num_heads_upsample=-1,
-        use_scale_shift_norm=True,
-        resblock_updown=True,
-        use_new_attention_order=True,
-    )
-
-
-def UNetSmall(
-    time_dim,
-    in_channels=3,
-    out_channels=3,
-    base_width=32,
-    num_classes=None,
-):
-    if time_dim == 128:
-        channel_mult = (1, 1, 2, 3, 4)
-    elif time_dim == 64:
-        channel_mult = (1, 2, 3, 4)
-    elif time_dim == 32:
-        channel_mult = (1, 2, 2, 2)
-    elif time_dim == 28:
-        channel_mult = (1, 2, 2, 2)
-    else:
-        raise ValueError(f"unsupported image size: {time_dim}")
-
-    attention_ds = []
-    if time_dim == 28:
-        attention_resolutions = "28,14,7"
-    else:
-        attention_resolutions = "32,16,8"
-    for res in attention_resolutions.split(","):
-        attention_ds.append(time_dim // int(res))
-
-    return UNetModel(
-        time_dim=time_dim,
-        in_channels=in_channels,
-        model_channels=base_width,
-        out_channels=out_channels,
-        num_res_blocks=2,
-        attention_resolutions=tuple(attention_ds),
-        time_emb_factor=2,
-        dropout=0.1,
-        channel_mult=channel_mult,
-        num_classes=num_classes,
-        use_checkpoint=False,
-        use_fp16=False,
-        num_heads=4,
-        num_heads_channels=32,
         num_heads_upsample=-1,
         use_scale_shift_norm=True,
         resblock_updown=True,
