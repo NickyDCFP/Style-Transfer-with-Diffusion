@@ -140,4 +140,3 @@ dependencies:
     - xxhash==3.4.1
     - yarl==1.9.4
     - yt-dlp==2024.3.10
-
