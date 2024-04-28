@@ -122,14 +122,14 @@ def sample_and_save_tracks(
         save_tracks(
             input_tracks,
             args,
-            f"lambda_{args.lambda_cyc}-{args.sampling_steps}-sampling_{args.partial_steps}-partial-input",
+            f"lambda_{args.lambda_cyc}-new-loss-{args.sampling_steps}-sampling_{args.partial_steps}-partial-input",
             metadata,
             False
         )
         save_tracks(
             style_tracks,
             args,
-            f"lambda_{args.lambda_cyc}-{args.sampling_steps}-sampling_{args.partial_steps}-partial-style",
+            f"lambda_{args.lambda_cyc}-new-loss-{args.sampling_steps}-sampling_{args.partial_steps}-partial-style",
             metadata,
             False
         )
@@ -149,7 +149,7 @@ def sample_and_save_tracks(
     save_tracks(
         sampled_specs,
         args,
-        f"lambda_{args.lambda_cyc}-{args.sampling_steps}-sampling_{args.partial_steps}-partial-use-style-{args.use_style}",
+        f"lambda_{args.lambda_cyc}-new-loss-{args.sampling_steps}-sampling_{args.partial_steps}-partial-use-style-{args.use_style}",
         metadata,
         args.save_specs,
     )

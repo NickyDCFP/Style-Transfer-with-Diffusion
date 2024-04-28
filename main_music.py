@@ -106,14 +106,14 @@ def main():
                     model.state_dict(),
                     os.path.join(
                         args.save_dir,
-                        f"lambda_{args.lambda_cyc}-{args.sampling_steps}-sampling_{args.partial_steps}-partial-use_style-{args.use_style}.pt",
+                        f"lambda_{args.lambda_cyc}-new-loss-{args.sampling_steps}-sampling_{args.partial_steps}-partial-use_style-{args.use_style}.pt",
                     ),
                 )
                 torch.save(
                     args.ema_dict,
                     os.path.join(
                         args.save_dir,
-                        f"lambda_{args.lambda_cyc}-{args.sampling_steps}-sampling_{args.partial_steps}-partial-use_style-{args.use_style}_ema_{args.ema_w}.pt",
+                        f"lambda_{args.lambda_cyc}-new-loss-{args.sampling_steps}-sampling_{args.partial_steps}-partial-use_style-{args.use_style}_ema_{args.ema_w}.pt",
                     ),
                 )
 

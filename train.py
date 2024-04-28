@@ -35,7 +35,7 @@ def train_one_epoch(
         xt, eps = diffusion.sample_from_forward_process(input_tracks, t)
         if args.use_style:
             pred_eps = model(xt, t, style_tracks)
-            loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (xt - style_tracks))).mean()
+            loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (input_tracks - style_tracks))).mean()
         else:
             pred_eps = model(xt, t)
             loss = ((pred_eps - eps) ** 2).mean()
