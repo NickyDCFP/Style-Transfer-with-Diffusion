@@ -20,5 +20,5 @@ python -m diffwave ./trained_models/ ./dataset/GTZAN/
 
 At the same time, you can train the diffusion models themselves to generate music.
 ```
-torchrun --nproc_per_node=4 main_music.py --arch UNet --batch-size 32 
+torchrun --nproc_per_node=4 main_music.py --arch UNet --batch-size 32 --sampling-steps 50 --partial-steps 250 --lambda-cyc 0.1
 ```
