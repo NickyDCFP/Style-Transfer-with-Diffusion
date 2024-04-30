@@ -13,9 +13,11 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from torchvision import transforms, datasets
 from data import get_metadata, get_dataset, fix_legacy_dict
 import unets
+from PIL import Image
+from torchmetrics.functional.image import image_gradients
 
 unsqueeze3x = lambda x: x[..., None, None, None]
 
@@ -104,7 +106,7 @@ class GaussianDiffusion:
 
     def sample_from_reverse_process(
         # MODIFICATION
-        self, model, xT, style, timesteps=None, model_kwargs={}, ddim=False
+        self, model, xT, style, timesteps=None, partial_steps=None, model_kwargs={}, ddim=False
     ):
         """Sampling images by iterating over all timesteps.
 
@@ -124,9 +126,15 @@ class GaussianDiffusion:
 
         # sub-sampling timesteps for faster sampling
         timesteps = timesteps or self.timesteps
-        new_timesteps = np.linspace(
-            0, self.timesteps - 1, num=timesteps, endpoint=True, dtype=int
-        )
+
+        if partial_steps:
+            new_timesteps = np.linspace(
+                0, partial_steps - 1, num=timesteps, endpoint=True, dtype=int
+            )    
+        else:
+            new_timesteps = np.linspace(
+                0, self.timesteps - 1, num=timesteps, endpoint=True, dtype=int
+            )
         alpha_bar = self.scalars["alpha_bar"][new_timesteps]
         new_betas = 1 - (
             alpha_bar / torch.nn.functional.pad(alpha_bar, [1, 0], value=1.0)[:-1]
@@ -203,6 +211,8 @@ def train_one_epoch(
     local_rank,
 ):
     model.train()
+    graytransform = transforms.Grayscale()
+
     for step, (images, labels) in enumerate(dataloader):
         assert (images.max().item() <= 1) and (0 <= images.min().item())
 
@@ -211,7 +221,7 @@ def train_one_epoch(
             2 * images.to(args.device) - 1,
             labels.to(args.device) if args.class_cond else None,
         )
-        t = torch.randint(diffusion.timesteps, (len(images),), dtype=torch.int64).to(
+        t = torch.randint(args.partial_steps, (len(images),), dtype=torch.int64).to(
             args.device
         )
         xt, eps = diffusion.sample_from_forward_process(images, t)
@@ -222,8 +232,22 @@ def train_one_epoch(
         pred_eps = model(xt, t, style_images, y=labels)
         
         # lambda_cyc: constant for the loss of the style image with the model output
-        loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (xt - style_images))).mean()
+        if args.loss_func == 'l1':
+            # loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (xt - style_images))).mean()
 
+            loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (images - style_images))).mean()
+
+        elif args.loss_func == 'grad':
+            input_grad = image_gradients(graytransform(images))
+            style_grad = image_gradients(graytransform(style_images))
+
+            input_mag = torch.sqrt(input_grad[0] ** 2 + input_grad[1] ** 2)
+            style_mag = torch.sqrt(style_grad[0] ** 2 + style_grad[1] ** 2)
+
+            loss = ((pred_eps - eps) ** 2 + args.lambda_cyc * torch.abs(pred_eps - (input_mag - style_mag))).mean()
+        
+        else:
+            loss = ((pred_eps - eps) ** 2).mean()
 
         optimizer.zero_grad()
         loss.backward()
@@ -249,6 +273,7 @@ def sample_N_images(
     style,
     xT=None,
     sampling_steps=250,
+    
     batch_size=64,
     num_channels=3,
     image_size=32,
@@ -293,7 +318,7 @@ def sample_N_images(
             else:
                 y = None
             gen_images = diffusion.sample_from_reverse_process(
-                model, xT, style, sampling_steps, {"y": y}, args.ddim
+                model=model, xT=xT, style=style, timesteps=sampling_steps, model_kwargs={"y": y}, ddim=args.ddim, partial_steps=args.partial_steps
             )
             samples_list = [torch.zeros_like(gen_images) for _ in range(num_processes)]
             if args.class_cond:
@@ -325,6 +350,12 @@ def main():
         type=int,
         default=1000,
         help="Number of timesteps in diffusion process",
+    )
+    parser.add_argument(
+        "--partial-steps",
+        type=int,
+        default=250,
+        help="Number of partial noising steps",
     )
     parser.add_argument(
         "--sampling-steps",
@@ -365,10 +396,15 @@ def main():
     )
         #MODIFICATION
     parser.add_argument("--lambda_cyc", type=float, default=0.05)
+    parser.add_argument("--loss_func", type=str, default='l1')
+    parser.add_argument("--style_image_path", type=str, default='')
+    parser.add_argument("--input_images_path", type=str, default='')
     
     # misc
     parser.add_argument("--save-dir", type=str, default="./trained_models/")
     parser.add_argument("--seed", default=112233, type=int)
+
+    parser.add_argument("--outname", type=str, default=None)
 
     # setup
     args = parser.parse_args()
@@ -434,12 +470,47 @@ def main():
 
     # sampling
     if args.sampling_only:
+        style_transform = transforms.Compose(
+            [
+                transforms.Resize(64),
+                transforms.ToTensor()
+            ]
+        )
+        if args.style_image_path != '':
+            try:
+                style_image = Image.open(args.style_image_path)
+                style_image = style_transform(style_image)
+            except:
+                print(f"Ooops something went wrong with the style image path you provided. \nPath provided: {args.style_image_path}")
+
+        else:
+            print(f"No style image provided. Please provide an image to generate samples.")
+            return
+        
+        if args.input_images_path != '':
+            if os.path.isdir(args.input_images_path):
+                input_images = []
+                for img_file in os.listdir(args.input_images_path):
+                    input_images.append(style_transform(Image.open(args.input_images_path + img_file)).to(args.device))
+
+                input_images = torch.stack(input_images, dim=0)
+
+            else:
+                input_images = style_transform(Image.open(args.input_images_path)).to(args.device)
+
+            input_images, _ = diffusion.sample_from_forward_process(input_images, args.partial_steps)
+            style_image = torch.stack([style_image] * len(input_images))
+
+        else:
+            print(f"No input image provided. Please provide an image to generate samples.")
+            return
+
         sampled_images, labels, _ = sample_N_images(
-            args.num_sampled_images,
+            len(input_images),
             model,
             diffusion,
-            train_loader.dataset[0],
-            None,
+            style_image,
+            input_images,
             args.sampling_steps,
             args.batch_size,
             metadata.num_channels,
@@ -447,13 +518,37 @@ def main():
             metadata.num_classes,
             args,
         )
+
+        if args.outname:
+            output_name = args.outname
+        else:
+            output_name = f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}_partial-steps-{args.partial_steps}_loss-{args.loss_func}_images-class_condn_{args.class_cond}"
+
         np.savez(
             os.path.join(
                 args.save_dir,
-                f"{args.arch}_{args.dataset}-{args.sampling_steps}-sampling_steps-{len(sampled_images)}_images-class_condn_{args.class_cond}.npz",
+                f"{output_name}.npz",
             ),
             sampled_images,
             labels,
+        )
+
+        # print(sampled_images)
+
+        cv2.imwrite(
+            os.path.join(
+                args.save_dir,
+                f"{output_name}.png",
+            ),
+            np.concatenate(sampled_images, axis=1)[:, :, ::-1],
+        )
+
+        cv2.imwrite(
+            os.path.join(
+                args.save_dir,
+                f"{output_name}_style_image.png",
+            ),
+            style_image[0].numpy().T * 255
         )
         return
 
@@ -468,6 +563,7 @@ def main():
         num_workers=4,
         pin_memory=True,
     )
+
     if local_rank == 0:
         print(
             f"Training dataset loaded: Number of batches: {len(train_loader)}, Number of images: {len(train_set)}"
@@ -483,12 +579,22 @@ def main():
             sampler.set_epoch(epoch)
         train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args, local_rank)
         if not epoch % 1:
+            if args.style_image_path:
+                style_transform = transforms.Compose(
+                    [
+                        transforms.Resize(64),
+                        transforms.ToTensor()
+                    ]
+                )
+                style_image = style_transform(Image.open(args.style_image_path))
+            else:
+                style_image = train_loader.dataset[np.random.randint(len(train_loader.dataset))]
             sampled_images, _, style_image = sample_N_images(
                 64,
                 model,
                 diffusion,
                 # MODIFICATION
-                train_loader.dataset[0],
+                style_image,
                 None,
                 args.sampling_steps,
                 args.batch_size,
@@ -501,7 +607,7 @@ def main():
                 cv2.imwrite(
                     os.path.join(
                         args.save_dir,
-                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}.png",
+                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}_partial-steps-{args.partial_steps}_loss-{args.loss_func}.png",
                     ),
                     np.concatenate(sampled_images, axis=1)[:, :, ::-1],
                 )
@@ -509,7 +615,7 @@ def main():
                 cv2.imwrite(
                     os.path.join(
                         args.save_dir,
-                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}_style_image.png",
+                        f"{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_epochs-{args.epochs}_partial-steps-{args.partial_steps}_loss-{args.loss_func}_style_image.png",
                     ),
                     style_image.numpy().T * 255
                 )
@@ -519,14 +625,14 @@ def main():
                 model.state_dict(),
                 os.path.join(
                     args.save_dir,
-                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}.pt",
+                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_lambda_cyc-{args.lambda_cyc}_partial-steps-{args.partial_steps}_loss-{args.loss_func}.pt",
                 ),
             )
             torch.save(
                 args.ema_dict,
                 os.path.join(
                     args.save_dir,
-                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}_lambda_cyc-{args.lambda_cyc}.pt",
+                    f"{args.dataset}-epoch_{args.epochs}-{args.sampling_steps}-sampling_steps_ema_{args.ema_w}_lambda_cyc-{args.lambda_cyc}_partial-steps-{args.partial_steps}_loss-{args.loss_func}.pt",
                 ),
             )
 

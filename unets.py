@@ -764,8 +764,8 @@ class UNetModel(nn.Module):
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
         if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)    
+            assert y.shape == (x.shape[0],) 
+            emb = emb + self.label_emb(y) 
         
         # MODIFICATION
         # style_image_embeddings = []
@@ -773,6 +773,11 @@ class UNetModel(nn.Module):
         # for s in style_image:
         #     style_image_embeddings.append(self.image_embed(s))
         # emb = emb + np.array(style_image_embeddings)
+        
+        # if style_image is not None:
+        #     print(style_image.shape)
+        #     print(emb.shape)
+        #     assert style_image.size() == x.size()
         emb = emb + self.image_embed(style_image)
         
         h = x.type(self.dtype)
