@@ -1,6 +1,6 @@
 # CATlation: Style Transfer with Diffusion Models!
 
-Codebase for Advanced ML Project with Professor Anna Choromanska. Paper is available in report.pdf
+Codebase for Advanced ML Project with Professor Anna Choromanska. Paper is available in [report.pdf]
 
 Heavily based on a [previous paper](https://arxiv.org/abs/2105.03117) that used GANs for the same task.
 
